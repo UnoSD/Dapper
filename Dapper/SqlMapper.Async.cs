@@ -388,6 +388,60 @@ namespace Dapper
             }
         }
 
+        private static async Task<IReadOnlyCollection<T>> QueryAsync<T>(this IDbConnection cnn, string sql, object param = null, IDbTransaction transaction = null, int? commandTimeout = null, CommandType? commandType = null, CancellationToken token = default(CancellationToken))
+        {
+            var effectiveType = typeof(T);
+            var command = new CommandDefinition(sql, param, transaction, commandTimeout, commandType, CommandFlags.Buffered, token);
+
+            var identity = new Identity(sql, commandType, cnn, effectiveType, param?.GetType(), null);
+            var info = GetCacheInfo(identity, param, command.AddToCache);
+            bool wasClosed = cnn.State == ConnectionState.Closed;
+
+            using (var cmd = (DbCommand)command.SetupCommand(cnn, info.ParamReader))
+            {
+                DbDataReader reader = null;
+                try
+                {
+                    if (wasClosed) await ((DbConnection)cnn).OpenAsync(token).ConfigureAwait(false);
+                    reader = await ExecuteReaderWithFlagsFallbackAsync(cmd, wasClosed, CommandBehavior.SequentialAccess | CommandBehavior.SingleResult, token).ConfigureAwait(false);
+
+                    var tuple = info.Deserializer;
+                    int hash = GetColumnHash(reader);
+                    if (tuple.Func == null || tuple.Hash != hash)
+                    {
+                        tuple = info.Deserializer = new DeserializerState(hash, GetDeserializer(effectiveType, reader, 0, -1, false));
+                        if (command.AddToCache) SetQueryCache(identity, info);
+                    }
+
+                    var func = tuple.Func;
+                    
+                    var buffer = new List<T>();
+                    var convertToType = Nullable.GetUnderlyingType(effectiveType) ?? effectiveType;
+                    while (await reader.ReadAsync(token).ConfigureAwait(false))
+                    {
+                        object val = func(reader);
+                        if (val == null || val is T)
+                        {
+                            buffer.Add((T)val);
+                        }
+                        else
+                        {
+                            buffer.Add((T)Convert.ChangeType(val, convertToType, CultureInfo.InvariantCulture));
+                        }
+                    }
+                    while (await reader.NextResultAsync(token).ConfigureAwait(false)) { /* ignore subsequent result sets */ }
+                    command.OnCompleted();
+
+                    return buffer;
+                }
+                finally
+                {
+                    using (reader) { /* dispose if non-null */ }
+                    if (wasClosed) cnn.Close();
+                }
+            }
+        }
+
         private static async Task<T> QueryRowAsync<T>(this IDbConnection cnn, Row row, Type effectiveType, CommandDefinition command)
         {
             object param = command.Parameters;
